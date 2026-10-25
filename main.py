@@ -1,106 +1,189 @@
-import sys
-import os
-import requests
-import json
-from colorama import Fore, Back, Style
-import time
+"""Local test harness for RootKit launcher custom-code modules.
+
+Usage:
+    python main.py <settingsProfile> <yoloVersion> <modelFileName> <customCode>
+
+Example:
+    python main.py Default 5 v5_base_s.pt example_bare.main
+"""
+
+from __future__ import annotations
+
+import argparse
 import importlib
+import os
 import sys
+import time
+import traceback
+from pathlib import Path
 
-def prRed(skk): print(Fore.RED, skk, Style.RESET_ALL)
-def prGreen(skk): print(Fore.GREEN + skk + Style.RESET_ALL)
-def prYellow(skk): print(Fore.YELLOW + skk + Style.RESET_ALL)
-def prBlue(skk): print(Fore.BLUE + skk + Style.RESET_ALL)
-def prPurple(skk): print(Fore.MAGENTA, skk + Style.RESET_ALL)
-def prCyan(skk): print(Fore.CYAN + skk + Style.RESET_ALL)
-def prLightGray(skk): print(Fore.WHITE + skk + Style.RESET_ALL)
-def prBlack(skk): print(Fore.BLACK + skk + Style.RESET_ALL)
+from colorama import Fore, Style, init as colorama_init
 
-appdataLocation = os.getenv("LOCALAPPDATA")
-appdata = os.getenv("APPDATA")
-currentDirectory = os.path.dirname(os.path.realpath(__file__))
-os.environ['Path'] += f';{appdataLocation}\\Programs\\Python\\Python311\\Scripts'
-os.environ['Path'] += f';{appdataLocation}\\Programs\\Python\\Python311\\'
-os.environ['Path'] += ';C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8'
-os.environ['Path'] += ';C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\bin'
-os.environ['Path'] += ';C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\libnvvp'
-os.environ['Path'] += ';C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8\\lib'
-os.environ['CUDA_PATH'] = 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8'
-os.environ['CUDA_PATH_V11_8'] = 'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8'
+colorama_init(autoreset=True)
 
+# When True, simulate a paid-tier unlock for local testing.
 TEST = True
 
-def main():
-    customCode = None
-    if len(sys.argv) > 3:
-        settingsProfile = sys.argv[1]
-        yoloVersion = int(sys.argv[2])
-        modelFileName = sys.argv[3]
-    else:
-        print("That's not how you run this. Tsk, tsk, try again.")
-        prRed("python main.py <settingsProfile> <yoloVersion> <modelFileName> <customCode>")
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _print(color: str, message: object) -> None:
+    print(f"{color}{message}{Style.RESET_ALL}")
+
+
+def pr_red(message: object) -> None:
+    _print(Fore.RED, message)
+
+
+def pr_green(message: object) -> None:
+    _print(Fore.GREEN, message)
+
+
+def pr_yellow(message: object) -> None:
+    _print(Fore.YELLOW, message)
+
+
+def pr_blue(message: object) -> None:
+    _print(Fore.BLUE, message)
+
+
+def _extend_windows_path() -> None:
+    """Append common Windows CUDA / Python paths when present (no-op elsewhere)."""
+    if os.name != "nt":
         return
-    
-    if len(sys.argv) > 4:
+
+    local_appdata = os.getenv("LOCALAPPDATA") or ""
+    path_additions = [
+        rf"{local_appdata}\Programs\Python\Python311\Scripts",
+        rf"{local_appdata}\Programs\Python\Python311",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\libnvvp",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\lib",
+    ]
+
+    current_path = os.environ.get("Path") or os.environ.get("PATH") or ""
+    for entry in path_additions:
+        if entry and entry not in current_path and Path(entry).exists():
+            current_path = f"{current_path};{entry}"
+
+    os.environ["Path"] = current_path
+    os.environ["PATH"] = current_path
+
+    cuda_root = Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8")
+    if cuda_root.exists():
+        os.environ.setdefault("CUDA_PATH", str(cuda_root))
+        os.environ.setdefault("CUDA_PATH_V11_8", str(cuda_root))
+
+
+def _resolve_model_backend(model_file_name: str) -> tuple[int, str]:
+    extension = Path(model_file_name).suffix.lower()
+    backends = {
+        ".pt": (0, "Fast (PyTorch)"),
+        ".onnx": (1, "Faster (ONNX)"),
+        ".engine": (2, "Fastest (TensorRT)"),
+    }
+    if extension not in backends:
+        raise ValueError("Invalid model file extension. Please use .pt, .onnx, or .engine")
+    return backends[extension]
+
+
+def _load_custom_code(module_path: str):
+    """Import a dotted module path such as ``example_bare.main``."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+
+    # Preserve legacy behavior: also add the top-level package directory so
+    # custom code that uses absolute sibling imports (e.g. ``import gameSelection``)
+    # continues to work.
+    package_name = module_path.split(".", 1)[0]
+    package_dir = REPO_ROOT / package_name
+    if package_dir.is_dir() and str(package_dir) not in sys.path:
+        sys.path.insert(0, str(package_dir))
+
+    try:
+        return importlib.import_module(module_path)
+    except Exception as err:
+        raise ImportError(f"Failed to import custom code '{module_path}': {err}") from err
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run a launcher-compatible custom code module locally.",
+    )
+    parser.add_argument("settings_profile", help="Settings profile name (without .json)")
+    parser.add_argument(
+        "yolo_version",
+        type=int,
+        choices=(5, 8),
+        help="YOLO major version (5 or 8)",
+    )
+    parser.add_argument("model_file_name", help="Model filename (.pt, .onnx, or .engine)")
+    parser.add_argument(
+        "custom_code",
+        nargs="?",
+        default=None,
+        help="Dotted module path exposing main(), e.g. example_bare.main",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    _extend_windows_path()
+
+    try:
+        args = parse_args(argv)
+    except SystemExit as exc:
+        # argparse already printed help / errors
+        return int(exc.code) if isinstance(exc.code, int) else 1
+
+    try:
+        bot_version, version_text = _resolve_model_backend(args.model_file_name)
+    except ValueError as err:
+        pr_red(err)
+        return 1
+
+    paid_tier = 1 if TEST else 0
+
+    pr_green(f"Version: {version_text} YOLOv{args.yolo_version} from {args.model_file_name}")
+    pr_green(f"Settings Profile: {args.settings_profile}")
+
+    if args.custom_code:
         try:
-            sys.path.append(f"{currentDirectory}\\{sys.argv[4].split('.')[0]}\\")
+            custom_code = _load_custom_code(args.custom_code)
+        except ImportError as err:
+            pr_red(err)
+            return 1
 
-            customCode = importlib.import_module(sys.argv[4])
-        except Exception as err:
-            raise Exception("Failed to import custom code")
-        
-        prBlue(f"Custom Code: {sys.argv[4]}")
-
-    botVersion = 0
-
-    if yoloVersion not in [5, 8]:
-        prRed("Invalid YOLO version. Please use 5 or 8")
-        return
-    
-    versionText = ""
-    _, fileExtension = os.path.splitext(modelFileName)
-    if fileExtension == ".pt":
-        botVersion = 0
-        versionText = "Fast (PyTorch)"
-    elif fileExtension == ".onnx":
-        botVersion = 1
-        versionText = "Faster (ONNX)"
-    elif fileExtension == ".engine":
-        botVersion = 2
-        versionText = "Fastest (TensorRT)"
-    else:
-        prRed("Invalid model file extension. Please use .pt, .onnx, or .engine")
-        return
-    
-    prGreen(f"Version: {versionText} YOLOv{yoloVersion} from {modelFileName}")
-
-    paidTier = 0
-
-    if TEST:
-        paidTier = 1
-
-    prGreen(f"Settings Profile: {settingsProfile}")
-
-    if customCode is not None:
-        customCode.main(
-            version=botVersion,
-            settingsProfile=settingsProfile,
-            paidTier=paidTier,
-            yoloVersion=yoloVersion,
-            modelFileName=modelFileName
+        pr_blue(f"Custom Code: {args.custom_code}")
+        custom_code.main(
+            version=bot_version,
+            settingsProfile=args.settings_profile,
+            paidTier=paid_tier,
+            yoloVersion=args.yolo_version,
+            modelFileName=args.model_file_name,
         )
     else:
-        prBlue("RUNNING MAIN BOT")
+        pr_blue("RUNNING MAIN BOT")
+        pr_yellow("No custom code module provided; nothing else to run.")
+
+    return 0
+
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
-        main()
-    except Exception as e:
-        import traceback
-        prRed(traceback.format_exc())
-        prRed(e)
-        prYellow("Ask @Wonder for help in our Discord: https://discord.gg/rootkitorg")
-    
-    for i in range(3, 0, -1):
-        prYellow(f"Bot will close in {i} seconds")
+        exit_code = main()
+    except Exception as exc:
+        pr_red(traceback.format_exc())
+        pr_red(exc)
+        pr_yellow(
+            "Ask @Wonder for help in our Discord: https://discord.gg/rootkitorg"
+        )
+        exit_code = 1
+
+    for remaining in range(3, 0, -1):
+        pr_yellow(f"Bot will close in {remaining} seconds")
         time.sleep(1)
+
+    raise SystemExit(exit_code)

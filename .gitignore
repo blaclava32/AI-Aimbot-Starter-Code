@@ -3,6 +3,22 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Local model weights / engine artifacts
+*.pt
+*.onnx
+*.engine
+*.weights
+runs/
+wandb/
+.clearml/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
 # C extensions
 *.so
 
