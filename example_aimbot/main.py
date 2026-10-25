@@ -1,17 +1,47 @@
-from .schema.settings import Settings
+"""Open-source aimbot example wired for the RootKit launcher SDK."""
+
+from __future__ import annotations
+
 import json
 import os
-import torch
-import numpy as np
-import cv2
 import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
 import win32api
 import win32con
-import pandas as pd
-import gc
-from .utils.general import (cv2, non_max_suppression, xyxy2xywh)
 
-import gameSelection
+from .schema.settings import Settings
+from .utils.general import non_max_suppression, xyxy2xywh
+
+try:
+    from . import gameSelection
+except ImportError:
+    import gameSelection
+
+
+def _require_appdata() -> str:
+    appdata = os.getenv("APPDATA")
+    if not appdata:
+        raise EnvironmentError(
+            "APPDATA is not set. This starter targets the Windows launcher layout."
+        )
+    return appdata
+
+
+def _load_settings(appdata: str, settings_profile: str) -> Settings:
+    settings_path = Path(appdata) / "ai-aimbot-launcher" / "aimbotSettings" / (
+        f"{settings_profile.lower()}.json"
+    )
+    if not settings_path.is_file():
+        raise FileNotFoundError(f"Settings profile not found: {settings_path}")
+
+    with settings_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return Settings(**payload)
 
 
 def main(
@@ -19,178 +49,194 @@ def main(
     settingsProfile: str = "",
     paidTier: int = 0,
     yoloVersion: int = 0,
-    modelFileName: str = ""
-    ):
-    # getting %appdata%
-    appdataLocation = os.getenv("APPDATA")
-    settingsPath = os.path.join(appdataLocation, "ai-aimbot-launcher", "aimbotSettings", f"{settingsProfile.lower()}.json")
+    modelFileName: str = "",
+) -> None:
+    """Entrypoint invoked by the launcher / local ``main.py`` harness."""
+    del version, paidTier, yoloVersion  # Provided by the launcher contract.
 
-    # loading settings
-    with open(settingsPath, "r") as f:
-        settings = json.load(f)
-        settings = Settings(**settings)
+    appdata = _require_appdata()
+    settings = _load_settings(appdata, settingsProfile)
+    model_path = Path(appdata) / "ai-aimbot-launcher" / "models" / modelFileName
 
-    # getting model path
-    modelPath = os.path.join(appdataLocation, "ai-aimbot-launcher", "models", modelFileName)
-
-    if modelPath[-3:] != ".pt":
+    if model_path.suffix.lower() != ".pt":
         print("Fast Mode ONLY! (PyTorch)")
         return
 
-    Bot(modelPath, settings)
+    run_bot(str(model_path), settings)
 
 
-def Bot(
-        modelPath,
-        settings: Settings
-        ):
-    # External Function for running the game selection menu (gameSelection.py)
-    camera, cWidth, cHeight = gameSelection.gameSelection(settings)
+def run_bot(model_path: str, settings: Settings) -> None:
+    selection = gameSelection.gameSelection(settings)
+    if selection is None:
+        print("Game selection failed; exiting.")
+        return
 
-    # Used for forcing garbage collection
-    count = 0
-    sTime = time.time()
+    camera, center_width, center_height = selection
 
-    # Loading Yolo5 Small AI Model, for better results use yolov5m or yolov5l
-    model = torch.hub.load('ultralytics/yolov5', 'custom', path=modelPath)
-    stride, names, pt = model.stride, model.names, model.pt
+    cps_count = 0
+    sample_started_at = time.time()
+
+    model = torch.hub.load("ultralytics/yolov5", "custom", path=model_path)
+    names = model.names
 
     if torch.cuda.is_available():
         model.half()
 
-    # Used for colors drawn on bounding boxes
-    COLORS = np.random.uniform(0, 255, size=(1500, 3))
-
-    # Main loop Quit if Q is pressed
+    colors = np.random.uniform(0, 255, size=(1500, 3))
     last_mid_coord = None
-    with torch.no_grad():
-        while win32api.GetAsyncKeyState(settings.quitKey) == 0:
+    body_offset_factor = 0.2
 
-            # Getting Frame
-            npImg = np.array(camera.get_latest_frame())
+    try:
+        with torch.no_grad():
+            while win32api.GetAsyncKeyState(settings.quitKey) == 0:
+                np_img = np.array(camera.get_latest_frame())
 
-            if settings.useMask:
-                if not settings.maskLeft:
-                    npImg[-settings.maskHeight:, -settings.maskWidth:, :] = 0
-                elif settings.maskLeft:
-                    npImg[-settings.maskHeight:, :settings.maskWidth, :] = 0
+                if settings.useMask:
+                    if settings.maskLeft:
+                        np_img[-settings.maskHeight :, : settings.maskWidth, :] = 0
+                    else:
+                        np_img[-settings.maskHeight :, -settings.maskWidth :, :] = 0
+
+                image = torch.from_numpy(np_img)
+                if image.shape[2] == 4:
+                    image = image[:, :, :3]
+
+                image = torch.movedim(image, 2, 0)
+                if torch.cuda.is_available():
+                    image = image.half()
+                    image /= 255
+                if len(image.shape) == 3:
+                    image = image[None]
+
+                results = model(image, size=settings.screenShotHeight)
+                predictions = non_max_suppression(
+                    results,
+                    settings.confidence,
+                    settings.confidence,
+                    0,
+                    False,
+                    max_det=1000,
+                )
+
+                targets = []
+                for det in predictions:
+                    if not len(det):
+                        continue
+
+                    gain = torch.tensor(image.shape)[[0, 0, 0, 0]]
+                    for *xyxy, conf, _cls in reversed(det):
+                        targets.append(
+                            (
+                                xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gain
+                            )
+                            .view(-1)
+                            .tolist()
+                            + [float(conf)]
+                        )
+
+                targets_df = pd.DataFrame(
+                    targets,
+                    columns=[
+                        "current_mid_x",
+                        "current_mid_y",
+                        "width",
+                        "height",
+                        "confidence",
+                    ],
+                )
+
+                if len(targets_df) > 0:
+                    if settings.centerOfScreen:
+                        targets_df["dist_from_center"] = np.sqrt(
+                            (targets_df.current_mid_x - center_width) ** 2
+                            + (targets_df.current_mid_y - center_height) ** 2
+                        )
+                        targets_df = targets_df.sort_values("dist_from_center")
+
+                    if last_mid_coord is not None:
+                        # Track continuity distance for debugging / future use.
+                        # Historically sort_values(...) was not assigned, so
+                        # selection continued to use center-of-screen order above.
+                        targets_df["last_mid_x"] = last_mid_coord[0]
+                        targets_df["last_mid_y"] = last_mid_coord[1]
+                        targets_df["dist"] = np.linalg.norm(
+                            targets_df[["current_mid_x", "current_mid_y"]].values
+                            - targets_df[["last_mid_x", "last_mid_y"]].values,
+                            axis=1,
+                        )
+
+                    x_mid = targets_df.iloc[0].current_mid_x
+                    y_mid = targets_df.iloc[0].current_mid_y
+                    box_height = targets_df.iloc[0].height
+
+                    if settings.headshotMode:
+                        headshot_offset = box_height * settings.headshotDistanceModifier
+                    else:
+                        headshot_offset = box_height * body_offset_factor
+
+                    mouse_move = [
+                        x_mid - center_width,
+                        (y_mid - headshot_offset) - center_height,
+                    ]
+
+                    if win32api.GetKeyState(settings.activationKey):
+                        win32api.mouse_event(
+                            win32con.MOUSEEVENTF_MOVE,
+                            int(mouse_move[0] * settings.movementAmp),
+                            int(mouse_move[1] * settings.movementAmp),
+                            0,
+                            0,
+                        )
+                    last_mid_coord = [x_mid, y_mid]
                 else:
-                    raise Exception('ERROR: Invalid maskSide! Please use "left" or "right"')
+                    last_mid_coord = None
 
-            # Normalizing Data
-            im = torch.from_numpy(npImg)
-            if im.shape[2] == 4:
-                # If the image has an alpha channel, remove it
-                im = im[:, :, :3,]
+                if settings.visuals:
+                    for index in range(len(targets_df)):
+                        half_w = round(targets_df["width"].iloc[index] / 2)
+                        half_h = round(targets_df["height"].iloc[index] / 2)
+                        mid_x = targets_df["current_mid_x"].iloc[index]
+                        mid_y = targets_df["current_mid_y"].iloc[index]
+                        start_x = int(mid_x + half_w)
+                        start_y = int(mid_y + half_h)
+                        end_x = int(mid_x - half_w)
+                        end_y = int(mid_y - half_h)
 
-            im = torch.movedim(im, 2, 0)
-            if torch.cuda.is_available():
-                im = im.half()
-                im /= 255
-            if len(im.shape) == 3:
-                im = im[None]
+                        label = "{}: {:.2f}%".format(
+                            names.get(0, "Human")
+                            if isinstance(names, dict)
+                            else "Human",
+                            targets_df["confidence"].iloc[index] * 100,
+                        )
+                        color = colors[0]
+                        cv2.rectangle(np_img, (start_x, start_y), (end_x, end_y), color, 2)
+                        text_y = start_y - 15 if start_y - 15 > 15 else start_y + 15
+                        cv2.putText(
+                            np_img,
+                            label,
+                            (start_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            color,
+                            2,
+                        )
 
-            # Detecting all the objects
-            results = model(im, size=settings.screenShotHeight)
+                cps_count += 1
+                if (time.time() - sample_started_at) > 1:
+                    if settings.displayCPS:
+                        print(f"CPS: {cps_count}")
+                    cps_count = 0
+                    sample_started_at = time.time()
 
-            # Suppressing results that dont meet thresholds
-            pred = non_max_suppression(
-                results, settings.confidence, settings.confidence, 0, False, max_det=1000)
+                if settings.visuals:
+                    cv2.imshow("Live Feed", np_img)
+                    if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                        break
+    finally:
+        camera.stop()
+        if settings.visuals:
+            cv2.destroyAllWindows()
 
-            # Converting output to usable cords
-            targets = []
-            for i, det in enumerate(pred):
-                s = ""
-                gn = torch.tensor(im.shape)[[0, 0, 0, 0]]
-                if len(det):
-                    for c in det[:, -1].unique():
-                        n = (det[:, -1] == c).sum()  # detections per class
-                        s += f"{n} {names[int(c)]}, "  # add to string
 
-                    for *xyxy, conf, cls in reversed(det):
-                        targets.append((xyxy2xywh(torch.tensor(xyxy).view(
-                            1, 4)) / gn).view(-1).tolist() + [float(conf)])  # normalized xywh
-
-            targets = pd.DataFrame(
-                targets, columns=['current_mid_x', 'current_mid_y', 'width', "height", "confidence"])
-
-            center_screen = [cWidth, cHeight]
-
-            # If there are people in the center bounding box
-            if len(targets) > 0:
-                if (settings.centerOfScreen):
-                    # Compute the distance from the center
-                    targets["dist_from_center"] = np.sqrt((targets.current_mid_x - center_screen[0])**2 + (targets.current_mid_y - center_screen[1])**2)
-
-                    # Sort the data frame by distance from center
-                    targets = targets.sort_values("dist_from_center")
-
-                # Get the last persons mid coordinate if it exists
-                if last_mid_coord:
-                    targets['last_mid_x'] = last_mid_coord[0]
-                    targets['last_mid_y'] = last_mid_coord[1]
-                    # Take distance between current person mid coordinate and last person mid coordinate
-                    targets['dist'] = np.linalg.norm(
-                        targets.iloc[:, [0, 1]].values - targets.iloc[:, [4, 5]], axis=1)
-                    targets.sort_values(by="dist", ascending=False)
-
-                # Take the first person that shows up in the dataframe (Recall that we sort based on Euclidean distance)
-                xMid = targets.iloc[0].current_mid_x
-                yMid = targets.iloc[0].current_mid_y
-
-                box_height = targets.iloc[0].height
-                if settings.headshotMode:
-                    headshot_offset = box_height * 0.38
-                else:
-                    headshot_offset = box_height * 0.2
-
-                mouseMove = [xMid - cWidth, (yMid - headshot_offset) - cHeight]
-
-                # Moving the mouse
-                if win32api.GetKeyState(0x14):
-                    win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(
-                        mouseMove[0] * settings.movementAmp), int(mouseMove[1] * settings.movementAmp), 0, 0)
-                last_mid_coord = [xMid, yMid]
-
-            else:
-                last_mid_coord = None
-
-            # See what the bot sees
-            if settings.visuals:
-                # Loops over every item identified and draws a bounding box
-                for i in range(0, len(targets)):
-                    halfW = round(targets["width"][i] / 2)
-                    halfH = round(targets["height"][i] / 2)
-                    midX = targets['current_mid_x'][i]
-                    midY = targets['current_mid_y'][i]
-                    (startX, startY, endX, endY) = int(
-                        midX + halfW), int(midY + halfH), int(midX - halfW), int(midY - halfH)
-
-                    idx = 0
-
-                    # draw the bounding box and label on the frame
-                    label = "{}: {:.2f}%".format(
-                        "Human", targets["confidence"][i] * 100)
-                    cv2.rectangle(npImg, (startX, startY), (endX, endY),
-                                  COLORS[idx], 2)
-                    y = startY - 15 if startY - 15 > 15 else startY + 15
-                    cv2.putText(npImg, label, (startX, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS[idx], 2)
-
-            # Forced garbage cleanup every second
-            count += 1
-            if (time.time() - sTime) > 1:
-                if settings.displayCPS:
-                    print("CPS: {}".format(count))
-                count = 0
-                sTime = time.time()
-
-                # Uncomment if you keep running into memory issues
-                # gc.collect(generation=0)
-
-            # See visually what the Aimbot sees
-            if settings.visuals:
-                cv2.imshow('Live Feed', npImg)
-                if (cv2.waitKey(1) & 0xFF) == ord('q'):
-                    exit()
-    camera.stop()
+# Keep the historical name available for forks / docs that call Bot(...).
+Bot = run_bot
