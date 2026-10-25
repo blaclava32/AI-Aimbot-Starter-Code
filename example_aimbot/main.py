@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -11,11 +12,18 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
-import win32api
-import win32con
+from pydantic import ValidationError
 
 from .schema.settings import Settings
 from .utils.general import non_max_suppression, xyxy2xywh
+
+try:
+    import win32api
+    import win32con
+except ImportError as err:  # pragma: no cover - platform-specific
+    raise ImportError(
+        "example_aimbot requires pywin32 on Windows. Install with: pip install pywin32"
+    ) from err
 
 try:
     from . import gameSelection
@@ -26,22 +34,52 @@ except ImportError:
 def _require_appdata() -> str:
     appdata = os.getenv("APPDATA")
     if not appdata:
-        raise EnvironmentError(
+        raise OSError(
             "APPDATA is not set. This starter targets the Windows launcher layout."
         )
     return appdata
 
 
+def _plain_name(value: str, *, label: str) -> str:
+    """Reject empty names and path-like values for launcher profile/model fields."""
+    name = (value or "").strip()
+    if not name:
+        raise ValueError(f"{label} is empty")
+    if any(sep in name for sep in ("/", "\\")) or name in {".", ".."} or ".." in Path(name).parts:
+        raise ValueError(
+            f"Invalid {label} {value!r}: use a plain file/profile name, not a path"
+        )
+    return name
+
+
 def _load_settings(appdata: str, settings_profile: str) -> Settings:
-    settings_path = Path(appdata) / "ai-aimbot-launcher" / "aimbotSettings" / (
-        f"{settings_profile.lower()}.json"
+    profile = _plain_name(settings_profile, label="settingsProfile")
+    settings_path = (
+        Path(appdata) / "ai-aimbot-launcher" / "aimbotSettings" / f"{profile.lower()}.json"
     )
     if not settings_path.is_file():
         raise FileNotFoundError(f"Settings profile not found: {settings_path}")
 
-    with settings_path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    return Settings(**payload)
+    try:
+        with settings_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError as err:
+        raise ValueError(
+            f"Settings profile is not valid JSON ({settings_path}): {err}"
+        ) from err
+
+    if not isinstance(payload, dict):
+        raise TypeError(f"Settings profile must be a JSON object: {settings_path}")
+
+    try:
+        return Settings(**payload)
+    except ValidationError as err:
+        raise ValueError(f"Invalid settings in {settings_path}:\n{err}") from err
+
+
+def _resolve_model_path(appdata: str, model_file_name: str) -> Path:
+    name = _plain_name(model_file_name, label="modelFileName")
+    return Path(appdata) / "ai-aimbot-launcher" / "models" / name
 
 
 def main(
@@ -54,18 +92,30 @@ def main(
     """Entrypoint invoked by the launcher / local ``main.py`` harness."""
     del version, paidTier, yoloVersion  # Provided by the launcher contract.
 
+    if sys.platform != "win32":
+        raise OSError(
+            "example_aimbot requires Windows (BetterCam / pywin32 mouse APIs)."
+        )
+
     appdata = _require_appdata()
     settings = _load_settings(appdata, settingsProfile)
-    model_path = Path(appdata) / "ai-aimbot-launcher" / "models" / modelFileName
+    model_path = _resolve_model_path(appdata, modelFileName)
 
     if model_path.suffix.lower() != ".pt":
-        print("Fast Mode ONLY! (PyTorch)")
+        print(
+            f"This starter example supports Fast Mode only (PyTorch .pt). "
+            f"Got: {model_path.suffix or '(no extension)'}"
+        )
         return
+
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
 
     run_bot(str(model_path), settings)
 
 
 def run_bot(model_path: str, settings: Settings) -> None:
+    """Capture loop: detect targets and move the mouse while activation is held."""
     selection = gameSelection.gameSelection(settings)
     if selection is None:
         print("Game selection failed; exiting.")
@@ -79,7 +129,8 @@ def run_bot(model_path: str, settings: Settings) -> None:
     model = torch.hub.load("ultralytics/yolov5", "custom", path=model_path)
     names = model.names
 
-    if torch.cuda.is_available():
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
         model.half()
 
     colors = np.random.uniform(0, 255, size=(1500, 3))
@@ -89,22 +140,27 @@ def run_bot(model_path: str, settings: Settings) -> None:
     try:
         with torch.no_grad():
             while win32api.GetAsyncKeyState(settings.quitKey) == 0:
-                np_img = np.array(camera.get_latest_frame())
+                frame = camera.get_latest_frame()
+                if frame is None:
+                    continue
+
+                np_img = np.array(frame)
 
                 if settings.useMask:
+                    mask_h = min(settings.maskHeight, np_img.shape[0])
+                    mask_w = min(settings.maskWidth, np_img.shape[1])
                     if settings.maskLeft:
-                        np_img[-settings.maskHeight :, : settings.maskWidth, :] = 0
+                        np_img[-mask_h:, :mask_w, :] = 0
                     else:
-                        np_img[-settings.maskHeight :, -settings.maskWidth :, :] = 0
+                        np_img[-mask_h:, -mask_w:, :] = 0
 
                 image = torch.from_numpy(np_img)
                 if image.shape[2] == 4:
                     image = image[:, :, :3]
 
-                image = torch.movedim(image, 2, 0)
-                if torch.cuda.is_available():
+                image = torch.movedim(image, 2, 0).float() / 255.0
+                if use_cuda:
                     image = image.half()
-                    image /= 255
                 if len(image.shape) == 3:
                     image = image[None]
 
@@ -123,6 +179,7 @@ def run_bot(model_path: str, settings: Settings) -> None:
                     if not len(det):
                         continue
 
+                    # Batch dim is typically 1; keep historical scale behavior.
                     gain = torch.tensor(image.shape)[[0, 0, 0, 0]]
                     for *xyxy, conf, _cls in reversed(det):
                         targets.append(

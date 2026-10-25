@@ -6,7 +6,7 @@ Virtual-key codes match ``win32con`` values so this module imports without
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -87,33 +87,35 @@ KEY_MAP = {
 
 
 class Settings(BaseModel):
+    """Launcher aimbotSettings profile fields used by custom-code modules."""
+
     model_config = ConfigDict(extra="allow")
 
-    movementAmp: float = Field(default=0.3)
+    movementAmp: float = Field(default=0.3, gt=0)
     useMask: bool = Field(default=False)
     maskLeft: bool = Field(default=True)
-    maskWidth: int = Field(default=80)
-    maskHeight: int = Field(default=200)
+    maskWidth: int = Field(default=80, ge=0)
+    maskHeight: int = Field(default=200, ge=0)
     quitKey: int = Field(default=ord("Q"))
-    screenShotHeight: int = Field(default=320)
-    screenShotWidth: int = Field(default=320)
-    confidence: float = Field(default=0.5)
+    screenShotHeight: int = Field(default=320, gt=0)
+    screenShotWidth: int = Field(default=320, gt=0)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     headshotMode: bool = Field(default=True)
-    headshotDistanceModifier: float = Field(default=0.38)
+    headshotDistanceModifier: float = Field(default=0.38, ge=0.0)
     displayCPS: bool = Field(default=True)
     visuals: bool = Field(default=False)
     centerOfScreen: bool = Field(default=True)
     activationKey: int = Field(default=VK_CAPITAL)
     autoFire: bool = Field(default=False)
-    autoFireActivationDistance: int = Field(default=50)
+    autoFireActivationDistance: int = Field(default=50, ge=0)
     onnxChoice: int = Field(default=2)
     fovCircle: bool = Field(default=False)
-    fovCircleRadius: int = Field(default=160)
-    fovCircleRadiusDetectionModifier: float = Field(default=1.0)
+    fovCircleRadius: int = Field(default=160, ge=0)
+    fovCircleRadiusDetectionModifier: float = Field(default=1.0, gt=0)
     aimShakey: bool = Field(default=False)
-    aimShakeyStrength: int = Field(default=10)
+    aimShakeyStrength: int = Field(default=10, ge=0)
     toggleable: bool = Field(default=True)
-    gameTitle: Optional[str] = Field(default=None)
+    gameTitle: str | None = Field(default=None)
 
     @field_validator("activationKey", "quitKey", mode="before")
     @classmethod
@@ -124,14 +126,16 @@ class Settings(BaseModel):
         if not isinstance(key, str):
             raise TypeError(f"Key must be str or int, got {type(key).__name__}")
 
+        if key == "":
+            raise ValueError("Key name must not be empty")
+
         if len(key) == 1:
-            try:
-                return ord(key.upper())
-            except Exception:
-                print("Invalid activation key; defaulting to CapsLock")
-                return KEY_MAP["CapsLock"]
+            return ord(key.upper())
 
         try:
             return KEY_MAP[key]
         except KeyError as err:
-            raise ValueError(f"Unknown key name: {key!r}") from err
+            known = ", ".join(sorted(KEY_MAP))
+            raise ValueError(
+                f"Unknown key name: {key!r}. Use a single character or one of: {known}"
+            ) from err

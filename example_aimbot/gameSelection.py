@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Optional, Tuple
+from typing import Any
 
 import bettercam
 import pygetwindow
@@ -15,10 +15,11 @@ except ImportError:
     from schema.settings import Settings
 
 
-def gameSelection(
-    settings: Settings,
-) -> Optional[Tuple[bettercam.BetterCam, int, int]]:
-    """Prompt for a window, activate it, and start a BetterCam capture region."""
+def gameSelection(settings: Settings) -> tuple[Any, int, int] | None:
+    """Prompt for a window, activate it, and start a BetterCam capture region.
+
+    Returns ``(camera, center_width, center_height)`` or ``None`` on failure.
+    """
     try:
         video_game_windows = pygetwindow.getAllWindows()
         print("=== All Windows ===")
@@ -68,6 +69,7 @@ def gameSelection(
         activation_retries -= 1
 
     if not activation_success:
+        print("Could not activate the selected window after multiple attempts.")
         return None
 
     print("Successfully activated the game window...")
@@ -85,7 +87,7 @@ def gameSelection(
     center_width = settings.screenShotWidth // 2
     center_height = settings.screenShotHeight // 2
 
-    print(region)
+    print(f"Capture region (left, top, right, bottom): {region}")
 
     camera = bettercam.create(region=region, output_color="BGRA", max_buffer_len=512)
     if camera is None:

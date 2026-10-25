@@ -16,8 +16,10 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from types import ModuleType
 
-from colorama import Fore, Style, init as colorama_init
+from colorama import Fore, Style
+from colorama import init as colorama_init
 
 colorama_init(autoreset=True)
 
@@ -84,12 +86,18 @@ def _resolve_model_backend(model_file_name: str) -> tuple[int, str]:
         ".engine": (2, "Fastest (TensorRT)"),
     }
     if extension not in backends:
-        raise ValueError("Invalid model file extension. Please use .pt, .onnx, or .engine")
+        raise ValueError(
+            "Invalid model file extension. Please use .pt, .onnx, or .engine "
+            f"(got {model_file_name!r})"
+        )
     return backends[extension]
 
 
-def _load_custom_code(module_path: str):
+def _load_custom_code(module_path: str) -> ModuleType:
     """Import a dotted module path such as ``example_bare.main``."""
+    if not module_path or not module_path.strip():
+        raise ImportError("customCode module path is empty")
+
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
 
@@ -102,9 +110,15 @@ def _load_custom_code(module_path: str):
         sys.path.insert(0, str(package_dir))
 
     try:
-        return importlib.import_module(module_path)
+        module = importlib.import_module(module_path)
     except Exception as err:
         raise ImportError(f"Failed to import custom code '{module_path}': {err}") from err
+
+    if not callable(getattr(module, "main", None)):
+        raise ImportError(
+            f"Custom code '{module_path}' must expose a callable main(...)"
+        )
+    return module
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -124,6 +138,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="?",
         default=None,
         help="Dotted module path exposing main(), e.g. example_bare.main",
+    )
+    parser.add_argument(
+        "--no-countdown",
+        action="store_true",
+        help="Skip the exit countdown (useful for scripts / CI)",
     )
     return parser.parse_args(argv)
 
@@ -172,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     exit_code = 0
+    skip_countdown = "--no-countdown" in sys.argv
     try:
         exit_code = main()
     except Exception as exc:
@@ -182,8 +202,9 @@ if __name__ == "__main__":
         )
         exit_code = 1
 
-    for remaining in range(3, 0, -1):
-        pr_yellow(f"Bot will close in {remaining} seconds")
-        time.sleep(1)
+    if not skip_countdown:
+        for remaining in range(3, 0, -1):
+            pr_yellow(f"Bot will close in {remaining} seconds")
+            time.sleep(1)
 
     raise SystemExit(exit_code)
