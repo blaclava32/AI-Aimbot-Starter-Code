@@ -1,12 +1,12 @@
 #ifndef SPARK_KEYBOARD_H
 #define SPARK_KEYBOARD_H
 
-#include <stdint.h>
+#include "types.h"
 
 void keyboard_init(void);
-/* Blocking read of one ASCII character (0 if non-printable / ignored). */
+void keyboard_on_irq(void);
 char keyboard_getchar(void);
-/* Non-blocking: returns 1 and writes *out if a key is ready. */
 int keyboard_try_getchar(char *out);
+void keyboard_flush(void);
 
 #endif
