@@ -48,6 +48,8 @@ Example:
 python main.py Default 5 v5_base_s.pt example_bare.main
 ```
 
+Optional: `--no-countdown` skips the exit delay (handy for scripts).
+
 | Argument | Meaning |
 |----------|---------|
 | `settingsProfile` | JSON name under `%APPDATA%\ai-aimbot-launcher\aimbotSettings\` (without `.json`) |
@@ -55,7 +57,7 @@ python main.py Default 5 v5_base_s.pt example_bare.main
 | `modelFileName` | File under `%APPDATA%\ai-aimbot-launcher\models\` (`.pt`, `.onnx`, or `.engine`) |
 | `customCode` | Dotted module path with a `main` function, e.g. `example_bare.main` |
 
-Treat `customCode` like a Python import path relative to this repo.
+Treat `customCode` like a Python import path relative to this repo. Profile and model names must be plain filenames (no path separators).
 
 ## Deploying to the launcher
 
@@ -100,9 +102,12 @@ def main(
 
 ### Example 3 — load settings + model path
 
+Prefer the helpers in `example_bare/main.py` (JSON / validation errors, plain-name checks). Minimal sketch:
+
 ```python
 from .schema.settings import Settings
 import json
+from pathlib import Path
 import os
 
 def main(
@@ -113,27 +118,26 @@ def main(
     modelFileName: str = "",
 ):
     appdata = os.environ["APPDATA"]
-    settings_path = os.path.join(
-        appdata,
-        "ai-aimbot-launcher",
-        "aimbotSettings",
-        f"{settingsProfile.lower()}.json",
+    settings_path = (
+        Path(appdata)
+        / "ai-aimbot-launcher"
+        / "aimbotSettings"
+        / f"{settingsProfile.lower()}.json"
     )
 
-    with open(settings_path, "r", encoding="utf-8") as handle:
+    with settings_path.open("r", encoding="utf-8") as handle:
         settings = Settings(**json.load(handle))
 
-    model_path = os.path.join(
-        appdata, "ai-aimbot-launcher", "models", modelFileName
-    )
+    model_path = Path(appdata) / "ai-aimbot-launcher" / "models" / modelFileName
     print(settings.confidence, model_path)
 ```
 
 ## Example notes
 
-- **`example_bare`**: safest place to start; prints loaded settings metadata.
+- **`example_bare`**: safest place to start; loads/validates settings and prints metadata.
 - **`example_aimbot`**: Windows-only capture + mouse move loop; **PyTorch `.pt` only** in this starter. Hold the configured activation key (default Caps Lock) to move; press the quit key (default `Q`) to stop.
 - Vendored YOLOv5 helpers under `example_aimbot/models` and `example_aimbot/utils` come from upstream Ultralytics-style sources and are kept for compatibility.
+- CI runs ruff + unit tests on first-party code only (schemas / harness helpers); the full aimbot loop is not smoke-tested in CI.
 
 ## Pros of using the starter + launcher
 
